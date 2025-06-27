@@ -6,8 +6,8 @@ from tkinter import messagebox
 import datetime
 import os
 
-SAVE_DIR = "recordings"
-os.makedirs('L:\RecordingSaves', exist_ok=True)
+SAVE_DIR = "L:\RecordingSaves"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 is_recording = False
 recording_thread = None
@@ -55,7 +55,7 @@ def stop_recording():
 
 root = tk.Tk()
 root.title("Запись экрана")
-root.geometry("300x180")
+root.geometry("500x300")
 root.resizable(False, False)
 
 record_btn = tk.Button(root, text="Начать запись", command=start_recording, font=("Arial", 12), width=20)
