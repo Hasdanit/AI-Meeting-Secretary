@@ -2,13 +2,15 @@ import sounddevice as sd
 import soundfile as sf
 import threading
 import datetime
+import whisper
 import os
 import queue
-import json
-from vosk import Model, KaldiRecognizer
 from analyzer import analyze_text, save_to_docx
+from notion_integration import add_task_to_notion
 from google.generativeai import GenerativeModel, configure
 from dotenv import load_dotenv
+from tkinter import messagebox
+from pydub import AudioSegment
 
 load_dotenv()
 
@@ -20,12 +22,6 @@ class Recorder:
         self.SAMPLE_RATE = 16000
         self.CHANNELS = 1
         self.q = queue.Queue()
-
-        try:
-            self.vosk_model = Model("vosk-model-small-ru-0.22")
-        except Exception as e:
-            print("Ошибка загрузки модели Vosk:", e)
-            exit(1)
 
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
@@ -42,52 +38,111 @@ class Recorder:
     def audio_callback(self, indata, frames, time, status):
         if status:
             print(status)
-        self.q.put(bytes(indata))
+        self.q.put(indata.copy())
 
     def start(self, status_label):
         self.is_recording = True
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.file_path = os.path.join(self.SAVE_DIR, f"meeting_{timestamp}.wav")
-        self.transcript_path = os.path.join(self.SAVE_DIR, f"meeting_{timestamp}.txt")
 
         def _record():
-            rec = KaldiRecognizer(self.vosk_model, self.SAMPLE_RATE)
-            rec.SetWords(True)
-
-            with sf.SoundFile(self.file_path, mode='w', samplerate=self.SAMPLE_RATE, channels=self.CHANNELS) as wav_file:
-                with sd.RawInputStream(samplerate=self.SAMPLE_RATE, blocksize=8000, dtype='int16',
-                                       channels=self.CHANNELS, callback=self.audio_callback):
-                    with open(self.transcript_path, 'w', encoding='utf-8') as transcript_file:
+            try:
+                with sf.SoundFile(self.file_path, mode='w', samplerate=self.SAMPLE_RATE,
+                                  channels=self.CHANNELS) as wav_file:
+                    with sd.InputStream(samplerate=self.SAMPLE_RATE, channels=self.CHANNELS,
+                                        dtype='float32', callback=self.audio_callback):
                         while self.is_recording:
-                            data = self.q.get()
-                            wav_file.buffer_write(data, dtype='int16')
-                            if rec.AcceptWaveform(data):
-                                result = json.loads(rec.Result())
-                                transcript_file.write(result.get('text', '') + '\n')
-                        final_result = json.loads(rec.FinalResult())
-                        transcript_file.write(final_result.get('text', '') + '\n')
+                            wav_file.write(self.q.get())
+            except Exception as e:
+                print(f"Ошибка при записи аудио: {e}")
+                status_label.config(text="Статус: Ошибка записи", fg="red")
+                messagebox.showerror("Ошибка", f"Не удалось записать аудио: {str(e)}")
 
         self.thread = threading.Thread(target=_record)
         self.thread.start()
-        status_label.config(text="Статус: Запись и распознавание...", fg="green")
+        status_label.config(text="Статус: Запись...", fg="green")
 
     def stop(self, status_label):
         self.is_recording = False
         self.thread.join()
-        status_label.config(text="Статус: Остановлено", fg="red")
+        status_label.config(text="Статус: Транскрибирование...", fg="blue")
 
-        from tkinter import messagebox
-        messagebox.showinfo("Готово", f"Файлы сохранены:\n{self.file_path}\n{self.transcript_path}")
+        if not os.path.exists(self.file_path):
+            status_label.config(text="Статус: Ошибка", fg="red")
+            messagebox.showerror("Ошибка", f"Аудиофайл не найден: {self.file_path}")
+            return
 
-        # Чтение текста транскрипта
-        with open(self.transcript_path, "r", encoding="utf-8") as f:
-            raw_text = f.read()
+        try:
+            audio = AudioSegment.from_file(self.file_path)
+            audio = audio.set_channels(1).set_frame_rate(self.SAMPLE_RATE).set_sample_width(2)
+            converted_path = os.path.join(self.SAVE_DIR, "temp_converted.wav")
+            audio.export(converted_path, format="wav")
 
-        print("[...] Отправка текста в Gemini для анализа...")
-        summary, timeline, tasks = analyze_text(raw_text)
+            model = whisper.load_model("medium")
+            result = model.transcribe(converted_path, language="ru")
+            transcript_with_timestamps = ""
+            for segment in result["segments"]:
+                start_time = segment["start"]
+                text = segment["text"]
+                transcript_with_timestamps += f"[{start_time:.2f}] {text}\n"
+
+            self.transcript_path = os.path.join(self.SAVE_DIR, f"{os.path.splitext(os.path.basename(self.file_path))[0]}_transcript.txt")
+            with open(self.transcript_path, 'w', encoding='utf-8') as f:
+                f.write(transcript_with_timestamps)
+
+            os.remove(converted_path)
+
+            messagebox.showinfo("Готово", f"Файлы сохранены:\n{self.file_path}\n{self.transcript_path}")
+
+            self.process_transcript(transcript_with_timestamps, os.path.splitext(os.path.basename(self.file_path))[0])
+            status_label.config(text="Статус: Обработка завершена", fg="green")
+        except Exception as e:
+            status_label.config(text="Статус: Ошибка", fg="red")
+            messagebox.showerror("Ошибка", f"Произошла ошибка: {str(e)}")
+
+    def transcribe_file(self, file_path):
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Файл не найден: {file_path}")
+        if not file_path.endswith('.wav'):
+            raise ValueError("Файл должен быть в формате WAV")
+
+        try:
+            audio = AudioSegment.from_file(file_path)
+            audio = audio.set_channels(1).set_frame_rate(self.SAMPLE_RATE).set_sample_width(2)
+            converted_path = os.path.join(self.SAVE_DIR, "temp_converted.wav")
+            audio.export(converted_path, format="wav")
+
+            model = whisper.load_model("small")
+            result = model.transcribe(converted_path, language="ru")
+            transcript_with_timestamps = ""
+            for segment in result["segments"]:
+                start_time = segment["start"]
+                text = segment["text"]
+                transcript_with_timestamps += f"[{start_time:.2f}] {text}\n"
+
+            transcript_path = os.path.join(self.SAVE_DIR,
+                                          f"{os.path.splitext(os.path.basename(file_path))[0]}_transcript.txt")
+            with open(transcript_path, 'w', encoding='utf-8') as f:
+                f.write(transcript_with_timestamps)
+
+            os.remove(converted_path)
+            return transcript_with_timestamps
+        except Exception as e:
+            print(f"Ошибка при транскрибировании файла: {e}")
+            return None
+
+    def analyze_transcript(self, transcript):
+        return analyze_text(transcript)
+
+    def save_to_docx(self, filename_base, summary, timeline, tasks, transcript):
+        save_to_docx(filename_base, summary, timeline, tasks, transcript)
+
+    def send_to_notion(self, tasks):
+        for task in tasks:
+            add_task_to_notion(task.strip('- ').strip())
+
+    def process_transcript(self, transcript, filename_base):
+        summary, timeline, tasks = self.analyze_transcript(transcript)
         if summary and timeline and tasks:
-            print("[✔] Анализ завершён. Сохраняем в .docx")
-            filename_base = os.path.splitext(os.path.basename(self.file_path))[0]
-            save_to_docx(filename_base, summary, timeline, tasks, raw_text)
-        else:
-            print("[!] Анализ не удался.")
+            self.save_to_docx(filename_base, summary, timeline, tasks, transcript)
+            self.send_to_notion(tasks)
